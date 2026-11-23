@@ -1,0 +1,5 @@
+Pure Player 1.0.2 uses:
+- FFmpeg (LGPL 2.1+), loaded as shared libraries. Windows DLLs: LGPL shared build n8.1 from
+  https://github.com/BtbN/FFmpeg-Builds . Linux: the system libav* packages.
+- SDL 3.4.8 (zlib license), linked statically. https://libsdl.org
+- stb_truetype.h (public domain / MIT), src/stb_truetype.h.

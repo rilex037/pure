@@ -1,0 +1,482 @@
+From 221eb1019845bfd07fb16a40191982e70c667e93 Mon Sep 17 00:00:00 2001
+From: build <build@local>
+Date: Mon, 23 Nov 2026 02:06:48 +0000
+Subject: [PATCH] PurePlayer audio sync patches (pipewire/pulse/alsa/wasapi +
+ unit-correct pending frames)
+
+---
+ include/SDL3/SDL_audio.h              | 40 +++++++++++++++
+ src/audio/SDL_audio.c                 | 71 +++++++++++++++++++++++++++
+ src/audio/SDL_sysaudio.h              |  2 +
+ src/audio/alsa/SDL_alsa_audio.c       | 33 +++++++++++++
+ src/audio/pipewire/SDL_pipewire.c     | 49 ++++++++++++++++++
+ src/audio/pulseaudio/SDL_pulseaudio.c | 49 ++++++++++++++++++
+ src/audio/wasapi/SDL_wasapi.c         | 37 ++++++++++++++
+ 7 files changed, 281 insertions(+)
+
+diff --git a/include/SDL3/SDL_audio.h b/include/SDL3/SDL_audio.h
+index c72fe04..e655d00 100644
+--- a/include/SDL3/SDL_audio.h
++++ b/include/SDL3/SDL_audio.h
+@@ -993,6 +993,46 @@ extern SDL_DECLSPEC bool SDLCALL SDL_BindAudioStreams(SDL_AudioDeviceID devid, S
+  */
+ extern SDL_DECLSPEC bool SDLCALL SDL_BindAudioStream(SDL_AudioDeviceID devid, SDL_AudioStream *stream);
+ 
++/**
++ * Query the number of audio frames submitted to the device bound to `stream`
++ * that have not been heard yet: everything still queued in the stream plus
++ * all device / server-side latency (PipeWire/PulseAudio graph latency, ALSA
++ * ring buffer, ...). Sample-accurate audible-position support, the
++ * waveOutGetPosition() equivalent. (PurePlayer sync extension.)
++ */
++extern SDL_DECLSPEC bool SDLCALL SDL_GetAudioStreamPendingFrames(SDL_AudioStream *stream, Uint64 *pending_frames);
++
++/**
++ * Drop everything currently pending on the device bound to `stream`,
++ * like waveOutReset(). Does not clear the stream's own input queue.
++ * (PurePlayer sync extension.)
++ */
++extern SDL_DECLSPEC bool SDLCALL SDL_FlushAudioStreamDevice(SDL_AudioStream *stream);
++
++/**
++ * Query the number of audio frames that have been submitted to the device
++ * bound to `stream` but have not been heard by the listener yet. This
++ * includes data still queued in the stream plus all device/server-side
++ * latency (PipeWire/PulseAudio graph latency, ALSA ring buffer, ...).
++ *
++ * Returns true on success: the clock in a media player can subtract
++ * `pending_frames` from the total submitted frames to get the true audible
++ * position, sample-accurate, including every buffering stage.
++ *
++ * (PurePlayer addition; used for the audio-master sync clock.)
++ */
++extern SDL_DECLSPEC bool SDLCALL SDL_GetAudioStreamPendingFrames(SDL_AudioStream *stream, Uint64 *pending_frames);
++
++/**
++ * Drop everything currently pending on the device bound to `stream`
++ * (queued stream data + device-side buffered audio), like waveOutReset().
++ * Does NOT clear the stream's own input queue - flush that with
++ * SDL_ClearAudioStream() if needed.
++ *
++ * (PurePlayer addition; used when seeking to kill stale audio.)
++ */
++extern SDL_DECLSPEC bool SDLCALL SDL_FlushAudioStreamDevice(SDL_AudioStream *stream);
++
+ /**
+  * Unbind a list of audio streams from their audio devices.
+  *
+diff --git a/src/audio/SDL_audio.c b/src/audio/SDL_audio.c
+index c1e4241..414ef8e 100644
+--- a/src/audio/SDL_audio.c
++++ b/src/audio/SDL_audio.c
+@@ -22,6 +22,7 @@
+ 
+ #include "SDL_audio_c.h"
+ #include "SDL_sysaudio.h"
++#include "SDL_audioqueue.h"
+ #include "../thread/SDL_systhread.h"
+ 
+ // Available audio drivers
+@@ -838,6 +839,19 @@ static bool SDL_AudioPlayDevice_Default(SDL_AudioDevice *device, const Uint8 *bu
+ static bool SDL_AudioWaitRecordingDevice_Default(SDL_AudioDevice *device) { return true; /* no-op. */ }
+ static void SDL_AudioFlushRecording_Default(SDL_AudioDevice *device) { /* no-op. */ }
+ static void SDL_AudioCloseDevice_Default(SDL_AudioDevice *device) { /* no-op. */ }
++
++static bool SDL_AudioGetDevicePending_Default(SDL_AudioDevice *device, Uint64 *pending_frames)
++{
++    // Backend without timing information: report one device buffer,
++    // the most conservative estimate.
++    if (!pending_frames) {
++        return SDL_InvalidParamError("pending_frames");
++    }
++    *pending_frames = (Uint64)device->sample_frames;
++    return true;
++}
++
++static void SDL_AudioFlushPending_Default(SDL_AudioDevice *device) { /* no-op. */ }
+ static void SDL_AudioDeinitializeStart_Default(void) { /* no-op. */ }
+ static void SDL_AudioDeinitialize_Default(void) { /* no-op. */ }
+ static void SDL_AudioFreeDeviceHandle_Default(SDL_AudioDevice *device) { /* no-op. */ }
+@@ -890,6 +904,8 @@ static void CompleteAudioEntryPoints(void)
+     FILL_STUB(WaitRecordingDevice);
+     FILL_STUB(RecordDevice);
+     FILL_STUB(FlushRecording);
++    FILL_STUB(GetDevicePending);
++    FILL_STUB(FlushPending);
+     FILL_STUB(CloseDevice);
+     FILL_STUB(FreeDeviceHandle);
+     FILL_STUB(DeinitializeStart);
+@@ -1161,6 +1177,59 @@ static void MixFloat32Audio(float *dst, const float *src, const int buffer_size)
+ }
+ 
+ 
++// PurePlayer sync extension: true pending playback frames + flush.
++
++bool SDL_GetAudioStreamPendingFrames(SDL_AudioStream *stream, Uint64 *pending_frames)
++{
++    if (!pending_frames) {
++        return SDL_InvalidParamError("pending_frames");
++    }
++    *pending_frames = 0;
++    if (!stream || !stream->bound_device) {
++        return SDL_InvalidParamError("stream");
++    }
++    SDL_AudioDevice *device = stream->bound_device->physical_device;
++    if (!device || !device->hidden) {
++        return SDL_SetError("Audio stream is not bound to a device");
++    }
++    Uint64 dev_pending = 0;
++    if (!current_audio.impl.GetDevicePending(device, &dev_pending)) {
++        return false;
++    }
++    // PurePlayer sync: unit-correct pending count.
++    // - backend returns frames at the DEVICE sample rate -> rescale to the
++    //   stream's input rate (what the caller counts samples_written in).
++    // - queue bytes are stored in the stream's INPUT spec, NOT the device
++    //   spec (float32 8 B/frame vs S16 4 B/frame halved the queue before ->
++    //   clock ran ahead -> audio lagged).
++    double pend = (double)dev_pending;
++    if (device->spec.freq > 0) {
++        pend *= (double)stream->input_spec.freq / (double)device->spec.freq;
++    }
++    SDL_LockMutex(stream->lock);
++    const size_t queued = SDL_GetAudioQueueQueued(stream->queue);
++    SDL_UnlockMutex(stream->lock);
++    const Uint64 in_fsize = (Uint64)SDL_AUDIO_FRAMESIZE(stream->input_spec);
++    if (queued > 0 && in_fsize > 0) {
++        pend += (double)(queued / in_fsize);
++    }
++    *pending_frames = (Uint64)(pend + 0.5);
++    return true;
++}
++
++bool SDL_FlushAudioStreamDevice(SDL_AudioStream *stream)
++{
++    if (!stream || !stream->bound_device) {
++        return SDL_InvalidParamError("stream");
++    }
++    SDL_AudioDevice *device = stream->bound_device->physical_device;
++    if (!device || !device->hidden) {
++        return SDL_SetError("Audio stream is not bound to a device");
++    }
++    current_audio.impl.FlushPending(device);
++    return true;
++}
++
+ // Playback device thread. This is split into chunks, so backends that need to control this directly can use the pieces they need without duplicating effort.
+ 
+ void SDL_PlaybackAudioThreadSetup(SDL_AudioDevice *device)
+@@ -2199,6 +2268,8 @@ SDL_AudioDeviceID SDL_GetAudioStreamDevice(SDL_AudioStream *stream)
+     return result;
+ }
+ 
++/* PurePlayer sync extension: true pending playback frames + flush. */
++
+ SDL_AudioStream *SDL_OpenAudioDeviceStream(SDL_AudioDeviceID devid, const SDL_AudioSpec *spec, SDL_AudioStreamCallback callback, void *userdata)
+ {
+     SDL_AudioDeviceID logdevid = SDL_OpenAudioDevice(devid, spec);
+diff --git a/src/audio/SDL_sysaudio.h b/src/audio/SDL_sysaudio.h
+index 9104be8..7c76d01 100644
+--- a/src/audio/SDL_sysaudio.h
++++ b/src/audio/SDL_sysaudio.h
+@@ -158,6 +158,8 @@ typedef struct SDL_AudioDriverImpl
+     bool (*WaitRecordingDevice)(SDL_AudioDevice *device);
+     int (*RecordDevice)(SDL_AudioDevice *device, void *buffer, int buflen);
+     void (*FlushRecording)(SDL_AudioDevice *device);
++    bool (*GetDevicePending)(SDL_AudioDevice *device, Uint64 *pending_frames);  // PurePlayer sync: frames submitted but not yet audible (waveOutGetPosition equivalent)
++    void (*FlushPending)(SDL_AudioDevice *device);  // PurePlayer sync: drop device-side pending audio (waveOutReset equivalent)
+     void (*CloseDevice)(SDL_AudioDevice *device);
+     void (*FreeDeviceHandle)(SDL_AudioDevice *device); // SDL is done with this device; free the handle from SDL_AddAudioDevice()
+     void (*DeinitializeStart)(void); // SDL calls this, then starts destroying objects, then calls Deinitialize. This is a good place to stop hotplug detection.
+diff --git a/src/audio/alsa/SDL_alsa_audio.c b/src/audio/alsa/SDL_alsa_audio.c
+index ba9e103..8da566f 100644
+--- a/src/audio/alsa/SDL_alsa_audio.c
++++ b/src/audio/alsa/SDL_alsa_audio.c
+@@ -87,6 +87,9 @@ static int (*ALSA_snd_device_name_hint)(int, const char *, void ***);
+ static char *(*ALSA_snd_device_name_get_hint)(const void *, const char *);
+ static int (*ALSA_snd_device_name_free_hint)(void **);
+ static snd_pcm_sframes_t (*ALSA_snd_pcm_avail)(snd_pcm_t *);
++static int (*ALSA_snd_pcm_delay)(snd_pcm_t *, snd_pcm_sframes_t *);
++static int (*ALSA_snd_pcm_drop)(snd_pcm_t *);
++static int (*ALSA_snd_pcm_prepare)(snd_pcm_t *);
+ static size_t (*ALSA_snd_ctl_card_info_sizeof)(void);
+ static size_t (*ALSA_snd_pcm_info_sizeof)(void);
+ static int (*ALSA_snd_card_next)(int *);
+@@ -177,6 +180,9 @@ static bool load_alsa_syms(void)
+     SDL_ALSA_SYM(snd_device_name_get_hint);
+     SDL_ALSA_SYM(snd_device_name_free_hint);
+     SDL_ALSA_SYM(snd_pcm_avail);
++    SDL_ALSA_SYM(snd_pcm_delay);
++    SDL_ALSA_SYM(snd_pcm_drop);
++    SDL_ALSA_SYM(snd_pcm_prepare);
+     SDL_ALSA_SYM(snd_ctl_card_info_sizeof);
+     SDL_ALSA_SYM(snd_pcm_info_sizeof);
+     SDL_ALSA_SYM(snd_card_next);
+@@ -369,6 +375,31 @@ static int RecoverALSADevice(snd_pcm_t *pcm, int errnum)
+ 
+ 
+ // This function waits until it is possible to write a full sound buffer
++// PurePlayer sync: frames in the ALSA ring buffer not yet played.
++static bool ALSA_GetDevicePending(SDL_AudioDevice *device, Uint64 *pending_frames)
++{
++    if (!device->hidden || !device->hidden->pcm) {
++        *pending_frames = 0;
++        return true;
++    }
++    snd_pcm_sframes_t delay = 0;
++    if (ALSA_snd_pcm_delay(device->hidden->pcm, &delay) < 0 || delay < 0) {
++        *pending_frames = (Uint64)device->sample_frames;   // conservative fallback
++        return true;
++    }
++    *pending_frames = (Uint64)delay;
++    return true;
++}
++
++// PurePlayer sync: drop the ring buffer contents.
++static void ALSA_FlushPending(SDL_AudioDevice *device)
++{
++    if (device->hidden && device->hidden->pcm) {
++        ALSA_snd_pcm_drop(device->hidden->pcm);
++        ALSA_snd_pcm_prepare(device->hidden->pcm);
++    }
++}
++
+ static bool ALSA_WaitDevice(SDL_AudioDevice *device)
+ {
+     const int sample_frames = device->sample_frames;
+@@ -1588,6 +1619,8 @@ static bool ALSA_Init(SDL_AudioDriverImpl *impl)
+     impl->OpenDevice = ALSA_OpenDevice;
+     impl->ThreadInit = ALSA_ThreadInit;
+     impl->WaitDevice = ALSA_WaitDevice;
++    impl->GetDevicePending = ALSA_GetDevicePending;
++    impl->FlushPending = ALSA_FlushPending;
+     impl->GetDeviceBuf = ALSA_GetDeviceBuf;
+     impl->PlayDevice = ALSA_PlayDevice;
+     impl->CloseDevice = ALSA_CloseDevice;
+diff --git a/src/audio/pipewire/SDL_pipewire.c b/src/audio/pipewire/SDL_pipewire.c
+index b388275..3d9b18d 100644
+--- a/src/audio/pipewire/SDL_pipewire.c
++++ b/src/audio/pipewire/SDL_pipewire.c
+@@ -87,6 +87,8 @@ static int (*PIPEWIRE_pw_stream_connect)(struct pw_stream *, enum pw_direction,
+ static enum pw_stream_state (*PIPEWIRE_pw_stream_get_state)(struct pw_stream *stream, const char **error);
+ static struct pw_buffer *(*PIPEWIRE_pw_stream_dequeue_buffer)(struct pw_stream *);
+ static int (*PIPEWIRE_pw_stream_queue_buffer)(struct pw_stream *, struct pw_buffer *);
++static int (*PIPEWIRE_pw_stream_get_time_n)(struct pw_stream *, struct pw_time *, size_t);
++static int (*PIPEWIRE_pw_stream_flush)(struct pw_stream *, bool);
+ static struct pw_properties *(*PIPEWIRE_pw_properties_new)(const char *, ...)SPA_SENTINEL;
+ static int (*PIPEWIRE_pw_properties_set)(struct pw_properties *, const char *, const char *);
+ static int (*PIPEWIRE_pw_properties_setf)(struct pw_properties *, const char *, const char *, ...) SPA_PRINTF_FUNC(3, 4);
+@@ -180,6 +182,8 @@ static bool load_pipewire_syms(void)
+     SDL_PIPEWIRE_SYM(pw_stream_get_state);
+     SDL_PIPEWIRE_SYM(pw_stream_dequeue_buffer);
+     SDL_PIPEWIRE_SYM(pw_stream_queue_buffer);
++    SDL_PIPEWIRE_SYM(pw_stream_get_time_n);
++    SDL_PIPEWIRE_SYM(pw_stream_flush);
+     SDL_PIPEWIRE_SYM(pw_properties_new);
+     SDL_PIPEWIRE_SYM(pw_properties_set);
+     SDL_PIPEWIRE_SYM(pw_properties_setf);
+@@ -1286,6 +1290,10 @@ static void PIPEWIRE_Deinitialize(void)
+     }
+ }
+ 
++// PurePlayer sync: forward decls (definitions sit below PipewireInitialize)
++static bool PIPEWIRE_GetDevicePending(SDL_AudioDevice *device, Uint64 *pending_frames);
++static void PIPEWIRE_FlushPending(SDL_AudioDevice *device);
++
+ static bool PipewireInitialize(SDL_AudioDriverImpl *impl)
+ {
+     if (!pipewire_initialized) {
+@@ -1309,6 +1317,8 @@ static bool PipewireInitialize(SDL_AudioDriverImpl *impl)
+     impl->GetDeviceBuf = PIPEWIRE_GetDeviceBuf;
+     impl->RecordDevice = PIPEWIRE_RecordDevice;
+     impl->FlushRecording = PIPEWIRE_FlushRecording;
++    impl->GetDevicePending = PIPEWIRE_GetDevicePending;
++    impl->FlushPending = PIPEWIRE_FlushPending;
+     impl->CloseDevice = PIPEWIRE_CloseDevice;
+ 
+     impl->HasRecordingSupport = true;
+@@ -1317,6 +1327,45 @@ static bool PipewireInitialize(SDL_AudioDriverImpl *impl)
+     return true;
+ }
+ 
++// PurePlayer sync: frames submitted but not yet audible =
++// queued + resampler buffered + graph/device latency (pw_time docs),
++// the waveOutGetPosition() equivalent. rate is a fraction (1/samplerate).
++static bool PIPEWIRE_GetDevicePending(SDL_AudioDevice *device, Uint64 *pending_frames)
++{
++    struct SDL_PrivateAudioData *priv = device->hidden;
++    struct pw_time t;
++    if (!priv || !priv->stream) {
++        *pending_frames = 0;
++        return true;
++    }
++    SDL_zero(t);
++    PIPEWIRE_pw_thread_loop_lock(priv->loop);
++    const int rc = PIPEWIRE_pw_stream_get_time_n(priv->stream, &t, sizeof(t));
++    PIPEWIRE_pw_thread_loop_unlock(priv->loop);
++    if (rc != 0 || t.rate.num == 0 || t.rate.denom == 0) {
++        *pending_frames = (Uint64)device->sample_frames;   // conservative fallback
++        return true;
++    }
++    double s = ((double)t.queued + (double)t.buffered) / (double)device->spec.freq;
++    s += (double)t.delay * (double)t.rate.num / (double)t.rate.denom;
++    if (s < 0.0) {
++        s = 0.0;
++    }
++    *pending_frames = (Uint64)(s * (double)device->spec.freq + 0.5);
++    return true;
++}
++
++// PurePlayer sync: drop everything buffered server-side.
++static void PIPEWIRE_FlushPending(SDL_AudioDevice *device)
++{
++    struct SDL_PrivateAudioData *priv = device->hidden;
++    if (priv && priv->stream) {
++        PIPEWIRE_pw_thread_loop_lock(priv->loop);
++        PIPEWIRE_pw_stream_flush(priv->stream, false);
++        PIPEWIRE_pw_thread_loop_unlock(priv->loop);
++    }
++}
++
+ static bool PIPEWIRE_PREFERRED_Init(SDL_AudioDriverImpl *impl)
+ {
+     if (!PipewireInitialize(impl)) {
+diff --git a/src/audio/pulseaudio/SDL_pulseaudio.c b/src/audio/pulseaudio/SDL_pulseaudio.c
+index 2fcf078..943c3d5 100644
+--- a/src/audio/pulseaudio/SDL_pulseaudio.c
++++ b/src/audio/pulseaudio/SDL_pulseaudio.c
+@@ -123,6 +123,7 @@ static int (*PULSEAUDIO_pa_stream_peek)(pa_stream *, const void **, size_t *);
+ static int (*PULSEAUDIO_pa_stream_drop)(pa_stream *);
+ static pa_operation *(*PULSEAUDIO_pa_stream_flush)(pa_stream *,
+                                                    pa_stream_success_cb_t, void *);
++static int (*PULSEAUDIO_pa_stream_get_latency)(pa_stream *, pa_usec_t *, int *);
+ static int (*PULSEAUDIO_pa_stream_disconnect)(pa_stream *);
+ static void (*PULSEAUDIO_pa_stream_unref)(pa_stream *);
+ static void (*PULSEAUDIO_pa_stream_set_write_callback)(pa_stream *, pa_stream_request_cb_t, void *);
+@@ -243,6 +244,7 @@ static bool load_pulseaudio_syms(void)
+     SDL_PULSEAUDIO_SYM(pa_stream_peek);
+     SDL_PULSEAUDIO_SYM(pa_stream_drop);
+     SDL_PULSEAUDIO_SYM(pa_stream_flush);
++    SDL_PULSEAUDIO_SYM(pa_stream_get_latency);
+     SDL_PULSEAUDIO_SYM(pa_stream_unref);
+     SDL_PULSEAUDIO_SYM(pa_channel_map_init_auto);
+     SDL_PULSEAUDIO_SYM(pa_strerror);
+@@ -667,6 +669,51 @@ static void PulseCreateChannelMap(pa_channel_map *pacmap, uint8_t channels)
+ 
+ }
+ 
++// PurePlayer sync: pa_stream_get_latency = time a frame written now
++// takes until it is heard: the whole server+sink pipeline. waveOutGetPosition
++// equivalent. Uses the interpolated timing path when available.
++static bool PULSEAUDIO_GetDevicePending(SDL_AudioDevice *device, Uint64 *pending_frames)
++{
++    struct SDL_PrivateAudioData *h = device->hidden;
++    if (!h || !h->stream) {
++        *pending_frames = 0;
++        return true;
++    }
++    pa_usec_t usec = 0;
++    int neg = 0;
++    PULSEAUDIO_pa_threaded_mainloop_lock(pulseaudio_threaded_mainloop);
++    const int rc = PULSEAUDIO_pa_stream_get_latency(h->stream, &usec, &neg);
++    PULSEAUDIO_pa_threaded_mainloop_unlock(pulseaudio_threaded_mainloop);
++    if (rc != 0 || neg) {
++        *pending_frames = (Uint64)device->sample_frames;   // no timing data yet
++        return true;
++    }
++    double sec = (double)usec / 1000000.0;
++    if (sec < 0.0) {
++        sec = 0.0;
++    }
++    *pending_frames = (Uint64)(sec * (double)device->spec.freq + 0.5);
++    return true;
++}
++
++// PurePlayer sync: drop server-side buffered audio (waveOutReset).
++static void PULSEAUDIO_FlushPending(SDL_AudioDevice *device)
++{
++    struct SDL_PrivateAudioData *h = device->hidden;
++    if (!h || !h->stream) {
++        return;
++    }
++    PULSEAUDIO_pa_threaded_mainloop_lock(pulseaudio_threaded_mainloop);
++    pa_operation *op = PULSEAUDIO_pa_stream_flush(h->stream, NULL, NULL);
++    if (op) {
++        while (PULSEAUDIO_pa_operation_get_state(op) == PA_OPERATION_RUNNING) {
++            PULSEAUDIO_pa_threaded_mainloop_wait(pulseaudio_threaded_mainloop);
++        }
++        PULSEAUDIO_pa_operation_unref(op);
++    }
++    PULSEAUDIO_pa_threaded_mainloop_unlock(pulseaudio_threaded_mainloop);
++}
++
+ static bool PULSEAUDIO_OpenDevice(SDL_AudioDevice *device)
+ {
+     const bool recording = device->recording;
+@@ -1098,6 +1145,8 @@ static bool PULSEAUDIO_Init(SDL_AudioDriverImpl *impl)
+     impl->WaitRecordingDevice = PULSEAUDIO_WaitRecordingDevice;
+     impl->RecordDevice = PULSEAUDIO_RecordDevice;
+     impl->FlushRecording = PULSEAUDIO_FlushRecording;
++    impl->GetDevicePending = PULSEAUDIO_GetDevicePending;
++    impl->FlushPending = PULSEAUDIO_FlushPending;
+     impl->FreeDeviceHandle = PULSEAUDIO_FreeDeviceHandle;
+ 
+     impl->HasRecordingSupport = true;
+diff --git a/src/audio/wasapi/SDL_wasapi.c b/src/audio/wasapi/SDL_wasapi.c
+index c01f007..0d35521 100644
+--- a/src/audio/wasapi/SDL_wasapi.c
++++ b/src/audio/wasapi/SDL_wasapi.c
+@@ -642,6 +642,41 @@ static void WASAPI_FlushRecording(SDL_AudioDevice *device)
+     }
+ }
+ 
++static bool WASAPI_GetDevicePending(SDL_AudioDevice *device, Uint64 *pending_frames)
++{
++    // PurePlayer sync: frames submitted to the endpoint but not yet
++    // audible = GetCurrentPadding(). Exact waveOutGetPosition equivalent:
++    // the mixer queue the clock must subtract, including all device latency.
++    if (!pending_frames) {
++        return false;  // caller checks params; core already validated
++    }
++    if (!device->hidden || !device->hidden->client || device->recording) {
++        *pending_frames = 0;  // not activated yet (or capture): nothing audible is queued
++        return true;
++    }
++    UINT32 padding = 0;
++    if (WasapiFailed(device, IAudioClient_GetCurrentPadding(device->hidden->client, &padding))) {
++        return false;  // device lost; caller falls back to device->sample_frames
++    }
++    *pending_frames = (Uint64)padding;
++    return true;
++}
++
++static void WASAPI_FlushPending(SDL_AudioDevice *device)
++{
++    // PurePlayer sync: waveOutReset equivalent - drop everything still
++    // queued in the endpoint so stale pre-seek audio never plays out.
++    // Stop drains nothing (it just halts new processing); Stop + Reset
++    // together clear the shared buffer, then Start resumes immediately.
++    if (!device->hidden || !device->hidden->client || device->recording) {
++        return;
++    }
++    if (!WasapiFailed(device, IAudioClient_Stop(device->hidden->client))) {
++        WasapiFailed(device, IAudioClient_Reset(device->hidden->client));
++        WasapiFailed(device, IAudioClient_Start(device->hidden->client));
++    }
++}
++
+ static void WASAPI_CloseDevice(SDL_AudioDevice *device)
+ {
+     if (device->hidden) {
+@@ -979,6 +1014,8 @@ static bool WASAPI_Init(SDL_AudioDriverImpl *impl)
+     impl->WaitRecordingDevice = WASAPI_WaitDevice;
+     impl->RecordDevice = WASAPI_RecordDevice;
+     impl->FlushRecording = WASAPI_FlushRecording;
++    impl->GetDevicePending = WASAPI_GetDevicePending;   // PurePlayer sync
++    impl->FlushPending = WASAPI_FlushPending;           // PurePlayer sync
+     impl->CloseDevice = WASAPI_CloseDevice;
+     impl->DeinitializeStart = WASAPI_DeinitializeStart;
+     impl->Deinitialize = WASAPI_Deinitialize;
+-- 
+2.47.3
+

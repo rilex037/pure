@@ -1,0 +1,11 @@
+# build output (rebuilt by build_linux.sh / build_windows.bat)
+bin/
+
+# local build deps fetched by the build scripts
+sdl3/
+ffmpeg/
+sdl3-prefix/
+sdl3-src/
+build/
+*.o
+app_res.o
